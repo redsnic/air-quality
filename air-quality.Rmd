@@ -1,0 +1,512 @@
+---
+title: "Air Quality"
+author: "Nicolò Rossi"
+date: "12/6/2021"
+output: 
+    html_document: 
+        df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = F, warning = F, dev="CairoPNG", fig.align='center')
+library(tidyverse)
+library(skimr)
+library(gridExtra)
+library(ggcorrplot)
+library(ggbeeswarm)
+library(ggpubr)
+library(ggsignif)
+library(VIM)
+library(mice)
+library(ggbiplot)
+library(ggraph)
+library(M3C)
+library(factoextra)
+```
+
+# Analysis of the Air Quality dataset
+
+This document presents the analysis of an [air quality](https://archive.ics.uci.edu/ml/datasets/Air+Quality#) dataset, which records the readings of a control station in an Italian city.
+
+Here is reported the explanation for the features present in the dataset:
+
+* Date (DD/MM/YYYY)
+* Time (HH.MM.SS)
+* True hourly averaged concentration CO in mg/m^3 (reference analyzer)
+* PT08.S1 (tin oxide) hourly averaged sensor response (nominally CO targeted)
+* True hourly averaged overall Non Metanic HydroCarbons concentration in microg/m^3 (reference analyzer)
+* True hourly averaged Benzene concentration in microg/m^3 (reference analyzer)
+* PT08.S2 (titania) hourly averaged sensor response (nominally NMHC targeted)
+* True hourly averaged NOx concentration in ppb (reference analyzer)
+* PT08.S3 (tungsten oxide) hourly averaged sensor response (nominally NOx targeted)
+* True hourly averaged NO2 concentration in microg/m^3 (reference analyzer)
+* PT08.S4 (tungsten oxide) hourly averaged sensor response (nominally NO2 targeted)
+* PT08.S5 (indium oxide) hourly averaged sensor response (nominally O3 targeted)
+* Temperature in °C
+* Relative Humidity (%)
+* AH Absolute Humidity 
+
+PT08 measurements are relative to a newer experimental detector, while the other values 
+are from a reference device. We should expect the reference and experimental device to perform quite similarly 
+when analyzing the same molecule.
+
+> Note that the reference detectors response is in mg/m^3, while the newer devices are NOT calibrated.
+
+## Dataset Exploration
+
+We start the analysis by reading the dataset from a csv file:
+
+```{r}
+air.dataset <- read.csv("~/Scaricati/AirQualityUCI/AirQualityUCI.csv", sep=";")
+air.dataset %>% head(50)
+```
+
+We then proceed to clean up the dataset:
+
+```{r}
+# convert comma se
+comma.sep.double <- function(column){
+    map_dbl( column, ~ as.numeric(sub(",", ".", .))  )
+}
+
+# keep the right amount of rows
+air.dataset <- air.dataset[1:9357,]
+
+# cleanup
+air.dataset <- air.dataset %>% 
+    # drop X and X.1 empty columns
+    select(-X,-X.1) %>% 
+    # create a date object column with dates
+    mutate(date = as.Date(Date, "%d/%m/%Y")) %>%
+    # split the date colum into day/month/year columns
+    separate(Date, c("day", "month", "year")) %>% 
+    # simplify Time column and make it numeric
+    mutate(Time = map_int(Time, ~ as.integer(strsplit(., ".", fixed = TRUE)[[1]][1]) )) %>% 
+    # convert columns to numeric
+    mutate(
+        CO.GT. = CO.GT. %>% comma.sep.double,
+        C6H6.GT. = C6H6.GT. %>% comma.sep.double,
+        CO.GT. = CO.GT. %>% comma.sep.double,
+        CO.GT. = CO.GT. %>% comma.sep.double,
+        T = T %>% comma.sep.double,
+        RH = RH %>% comma.sep.double,
+        AH = AH %>% comma.sep.double,
+    ) %>% 
+    # replace -200 with NAs
+    mutate_at( 
+        c("CO.GT.", "PT08.S1.CO.", "NMHC.GT.", "C6H6.GT.", "PT08.S2.NMHC.", "NOx.GT.", "PT08.S3.NOx.", 
+          "NO2.GT.", "PT08.S4.NO2.", "PT08.S5.O3.", "T", "RH", "AH"),  
+        ~ifelse(as.character(.) == "-200", NA, .)
+    ) %>% mutate_at(c("day", "month", "year"), as.integer)
+
+air.dataset %>% head()
+```
+
+Finally, we print a quick summary of the available data:
+
+```{r}
+skim(air.dataset)
+```
+
+We continue by checking the distribution of the measurements of the different sensors (omitting NAs)
+
+```{r, warning=F}
+cols <- c( "CO.GT.", "PT08.S1.CO.", 
+           "NMHC.GT.", "PT08.S2.NMHC.",
+           "C6H6.GT.", "PT08.S5.O3.",
+           "NOx.GT.", "PT08.S3.NOx.", 
+           "NO2.GT.", "PT08.S4.NO2.")
+
+plot_hisogram <- function(df){
+    function(col_name){
+        col <- col_name
+        ggplot(df) +
+            geom_histogram(aes(x = df[, col]), alpha=0.7, bins = 30, color="black", fill="lightblue") +
+            geom_vline(xintercept = mean(df[, col], na.rm = T), color="red", linetype="dotted") +
+            geom_vline(xintercept = median(df[, col], na.rm = T), color="red", linetype="dashed") +
+            labs(x=col)
+    }
+} 
+
+plots <- purrr::map(cols, plot_hisogram(air.dataset))
+do.call("grid.arrange", c(plots, ncol=2))
+```
+We observe that NMHC.GT. counts are quite low.
+
+The remaining columns are T (temperature), RH (relative humidity) and AH (absolute humidity)
+
+```{r}
+cols <- c("T","RH","AH")
+plots <- purrr::map(cols, plot_hisogram(air.dataset))
+do.call("grid.arrange", c(plots, ncol=1))
+pairs(air.dataset %>% select(T,RH,AH))
+```
+
+From the plot, it looks like the absolute humidity tends to be high when the temperature is high, while the converse holds for relative humidity.
+This is due to the definition of $AH$ and $RH$:
+
+$$AH = \frac{m}{V}$$ is the ratio between the mass of water vapor and the volume of air and vapor mixture. $V$ is dependent by the temperature.
+
+$$RH = \frac{p}{p^*}$$ is, intuitively, the ratio of how much vapor the air is currently holding if compared to the maximal amount before condensation. Keep in mind that colder air can keep less vapor; this is an explanation of the negative correlation of RH with the temperature.
+
+We can now compare the correlations of all the available variables:
+
+```{r}
+cormat <- round(cor(air.dataset %>% select(T,RH,AH, dplyr::starts_with("PT08."), dplyr::ends_with("GT.")), use = "complete.obs") ,2)
+ggcorrplot(cormat, hc.order = TRUE, outline.col = "white")
+```
+
+NOx new and reference detectors seem to have an opposite output, this might be just an artifact due to the absence of calibration.
+
+```{r}
+pairs(air.dataset %>% select(dplyr::starts_with("PT08.")))
+```
+
+This plots show how the response of the detectors tend to be positively correlated, again with the exception of **S3** sensor of the experimental detector.
+
+```{r}
+pairs(air.dataset %>% select(dplyr::ends_with("GT.")))
+```
+
+The reference setup shows instead positive correlation between all sensors.
+
+## Temperature
+
+We can consider the temperature starting with a boxplot:
+
+```{r}
+df <- air.dataset %>% mutate(trimester = ((month-1) %/% 3) + 1) 
+
+ggplot(df) +
+    geom_boxplot(aes(x=as.factor(month), y=T)) +
+    labs(y = "Temperature", x="Month", title="Temperature measurements during the years 2004-2005")
+```
+
+we then divide the observations in four trimester and analyze the temperature distributions:
+
+```{r}
+(plot_hisogram(df))("T") +
+    facet_wrap(~ trimester) +
+    labs(title="Temperature distribution per trimester")
+```
+
+Quarter 2 and 3 seem to have a bell shaped distribution, we can check if those distributions can be considered normal with qqplots and Kolmogorov-Smirnov tests:
+
+```{r}
+ggplot(df) +
+    geom_qq(aes(sample=T)) +
+    geom_qq_line(aes(sample=T)) +
+    facet_wrap(~ trimester) +
+    labs(title="Qqplots for temperature distribution in per trimester")
+```
+
+```{r}
+for(i in 1:4){
+    print(i)
+    ks.test(df %>% filter(trimester==i) %>% pull(T) %>% scale, pnorm) %>% print
+}
+```
+
+Using the whole dataset:
+
+```{r}
+ks.test(df %>% pull(T) %>% scale, pnorm)
+```
+
+This shows how no trimester's temperature seems to be normally distributed. That could easily be caused by the fact huge differences in temperature 
+can be caused simply by weather changes (think for example of comparing rainy and sunny days, a probable cause of the bi-modality shown by histograms).
+
+
+### Comparing pollution
+
+We can now consider if pollution varies among trimesters and/or day of the week. We begin by considering trimesters:
+ 
+```{r}
+col.names <- df %>% select(dplyr::ends_with("GT.")) %>% colnames()
+for(i in col.names){
+    df. <- (df %>% select(!!i, trimester)) 
+    df. <- df.[complete.cases(df.), ]
+    levs <- levels( as.factor(df.$trimester) )
+    CN <- as.list(as.data.frame(combn(levs,2)))
+    p <- df. %>%
+        pivot_longer(dplyr::ends_with("GT."), names_to = "agent", values_to="values")%>% ggplot(aes(x = as.factor(trimester), y=values)) +
+        geom_violin() +
+        geom_boxplot(width=0.1) +
+        labs(title=paste(i, "readout per trimester"), x="trimester", y="readout")
+    print(p)
+}
+```
+
+From this plot we see that trimester 4 seems to be the more polluted in general, and that we completely miss NMHC measurements for the third and fourth trimesters. Due to the strong correlation between contaminants, it could be possible to estimate NMHC values with a linear regression model, we will consider this possibility when considering how to manage NA values.
+
+We can now consider days of the week, for example we can ask ourselves if pollution is higher during working days, or in the week-end:
+
+
+```{r}
+df <- df %>% mutate(weekday=factor(weekdays(date),  levels = c("lunedì" , "martedì", "mercoledì", "giovedì", "venerdì", "sabato", "domenica")))
+for(i in col.names){
+    df. <- (df %>% select(!!i, weekday)) 
+    df. <- df.[complete.cases(df.), ]
+    p <- df. %>%
+            pivot_longer(dplyr::ends_with("GT."), names_to = "agent", values_to="values")%>% ggplot(aes(x = as.factor(weekday), y=values)) +
+            geom_violin() +
+            geom_boxplot(width=0.1) +
+            facet_wrap(~ agent, scales = "free_y") 
+    print(p)
+}
+```
+
+it seems that pollution is lower on Sunday. We can test this, at least in a first approximation, with a paired t-test on the complete data:
+
+```{r}
+for(i in col.names){
+    print(i)
+    t.test(df %>% filter(weekday != "domenica") %>% pull(!!i), df %>% filter(weekday == "domenica") %>% pull(!!i)) %>% print
+}
+```
+Our hypothesis is strongly supported by all the t-tests.
+
+## Quick look at missing data
+
+We can start by exploring how the NA values are distributed in our dataset using the VIM package:
+
+
+```{r}
+df %>% aggr(cex.axis=.6, numbers=T,cex.numbers=0.6)
+```
+We observe that T, RH and AH have the same behavior in terms of NA values. Furthermore, they often relate to absence of data from other sensors.
+
+```{r}
+df %>% select(dplyr::ends_with("GT."), dplyr::starts_with("PT08")) %>% aggr(cex.axis=.6,numbers=T,cex.numbers=0.6)
+```
+Here it is more evident that the experimental detector can only be completely offline or fully functional.   
+
+```{r}
+par(mfrow=c(2,3))
+marginplot(df %>% select(CO.GT., PT08.S1.CO.))
+marginplot(df %>% select(NMHC.GT., PT08.S2.NMHC.))
+marginplot(df %>% select(NOx.GT., PT08.S3.NOx.))
+marginplot(df %>% select(C6H6.GT., PT08.S5.O3.))
+marginplot(df %>% select(NO2.GT., PT08.S4.NO2.))
+```
+
+## Considering time versus polluting agents
+
+We first transform the date and time of data acquisition into a real number:
+
+```{r}
+df <- df %>% mutate(num_time = (date %>% as.integer()) + (Time/24)) 
+"begin of the measurements"
+df[1, "date"]
+"end of the measurements"
+df[nrow(df), "date"]
+```
+We plot now the measurements of the reference device:
+
+```{r}
+ggplot(df %>% pivot_longer(dplyr::ends_with("GT."), names_to = "agent", values_to="values")) + 
+    geom_line(aes(x=num_time, y=values)) + 
+    facet_wrap(~ agent, scales = "free_y") +
+    geom_smooth(aes(x=num_time, y=values), color="red", linetype="dashed")
+```
+and of the newer one:
+
+```{r}
+ggplot(df %>% pivot_longer(dplyr::starts_with("P"), names_to = "agent", values_to="values")) + 
+    geom_line(aes(x=num_time, y=values)) + 
+    facet_wrap(~ agent, scales = "free_y") +
+    geom_smooth(aes(x=num_time, y=values), color="red", linetype="dashed")
+```
+
+We don't have reference data to calibrate the newer detector.
+
+## Managing NAs
+
+We now decide how to cope with NA values in our dataset. From the plots defined in the previous section about NA, we can decide to eliminate cases when 
+more than half of the detectors were shut down.
+
+First of all, we check the operational status of the reference detector when the experimental one is offline:
+
+```{r}
+df %>% filter(is.na(PT08.S1.CO.) & is.na(PT08.S2.NMHC.) & is.na(PT08.S3.NOx.) & is.na(PT08.S4.NO2.) & is.na(PT08.S5.O3.)) %>% 
+    select( dplyr::ends_with(".GT.")) %>% 
+    mutate_all( ~ ifelse(is.na(.),1,0)) %>%
+    select(-NMHC.GT., -C6H6.GT.) %>% 
+    group_by_all() %>% 
+    dplyr::summarise(n = n()) 
+```
+
+We have observed that C6H6.GT. is always non operational and that NMHC.GT. ceases to function after a while so we excluded them from this table. 
+
+When instead the newer detector is online:
+
+```{r}
+df %>% filter(!is.na(PT08.S1.CO.) & !is.na(PT08.S2.NMHC.) & !is.na(PT08.S3.NOx.) & !is.na(PT08.S4.NO2.) & !is.na(PT08.S5.O3.)) %>% 
+    select( dplyr::ends_with(".GT.")) %>% 
+    mutate_all( ~ ifelse(is.na(.),1,0)) %>%
+    select(-NMHC.GT., -C6H6.GT.) %>% 
+    group_by_all() %>% 
+    dplyr::summarise(n = n()) 
+```
+
+(here C6H6.GT. is always operational)
+
+To manage the NA values in this context, we can eliminate the 49 cases in which the newer and some older detector are offline. We will use instead 
+**regression imputation** for all the other cases.
+
+```{r}
+# remove 49 cases
+df <- df %>% filter(! (is.na(PT08.S1.CO.) & (is.na(CO.GT.) | is.na(NOx.GT.) | is.na(NO2.GT.))))
+# apply (stochastic) regression imputation
+imp <- mice(df, method = "norm.nob")
+df_filled <- complete(imp)
+```
+
+We can check now how NMHC.GT. and the other variables were imputed: 
+
+```{r}
+ggplot(df_filled %>% select(NMHC.GT., num_time)) + 
+    geom_line(aes(x=num_time, y=NMHC.GT.)) +
+    geom_smooth(aes(x=num_time, y=NMHC.GT.), color="red", linetype="dashed")
+```
+```{r}
+pairs(df_filled %>% select(dplyr::ends_with("GT.")))
+```
+
+Avoiding the use of T, AH and RH columns, the results differ widely for NMHC.GT.:
+
+```{r}
+imp <- mice(df %>% select(dplyr::starts_with("PT08."), dplyr::ends_with("GT."), num_time), method = "norm.nob")
+df_test <- complete(imp)
+ggplot(df_test %>% select(NMHC.GT., num_time)) + 
+    geom_line(aes(x=num_time, y=NMHC.GT.)) +
+    geom_smooth(aes(x=num_time, y=NMHC.GT.), color="red", linetype="dashed")
+```
+
+This continuously increasing trend is actually quite unexpected.
+
+```{r}
+plot(df_filled$NMHC.GT., df_test$NMHC.GT.)
+```
+> Note that we should not be able to see negative values from this detector
+
+## PCA
+
+as the measurement are quite correlated, it makes sense to consider the PCA technique:
+
+
+```{r}
+df. <-  (df_filled %>% select(-month,-year,-Time, -trimester, -weekday, -day, -date, -num_time)) %>% scale()
+pca_data <- df. %>% princomp()
+pca_data %>% summary
+cormat <- as.data.frame(cor(df., pca_data$scores))
+ggcorrplot(cormat, hc.order = TRUE, outline.col = "white")
+```
+
+```{r}
+# screeplot
+pca_var <- pca_data$sdev^2
+pve <- pca_var/sum(pca_var)
+ggplot(data.frame(pve=pve)) +
+    geom_area(aes(y=pve, x=1:length(pve)), fill = "lightblue", color="black", alpha = 0.4 ) +
+    geom_node_label(aes(y = pve, x=1:length(pve), label=formatC(cumsum(pve), digits=2, format = "f")) ) +
+    labs(title="Screeplot of PCA with Temperature and Humidity", x="# of Components", y = "fraction of explained variance")
+# colored by trimester
+ggbiplot(pca_data, alpha = 0.1, group = df_filled$trimester %>% as.factor())
+# colored by weekday
+ggbiplot(pca_data, alpha = 0.1, group = df_filled$weekday %>% as.factor())
+```
+These two biplots show how the summer tends to be less polluted and confirm our theories about weekends.
+
+```{r}
+pca_data$loadings
+```
+
+We repeat the analysis using only detector's data:
+
+```{r}
+df. <-  (df_filled %>% select(-month,-year,-Time, -trimester, -weekday, -day, -date, -T, -AH, -RH, -num_time)) %>% scale()
+pca_data <- df. %>% princomp()
+# screeplot
+pca_var <- pca_data$sdev^2
+pve <- pca_var/sum(pca_var)
+ggplot(data.frame(pve=pve)) +
+    geom_area(aes(y=pve, x=1:length(pve)), fill = "lightblue", color="black", alpha = 0.4 ) +
+    geom_node_label(aes(y = pve, x=1:length(pve), label=formatC(cumsum(pve), digits=2, format = "f")) ) +
+    labs(title="Screeplot of PCA with Temperature and Humidity", x="# of Components", y = "fraction of explained variance")
+ggbiplot(pca_data, alpha = 0.1, group = df_filled$trimester %>% as.factor()) 
+ggbiplot(pca_data, alpha = 0.1, group = df_filled$weekday %>% as.factor())
+```
+
+This shows how T, AH and RH have an impact on the explained variance, as seen before in the loadings of the second component. There are not evident clusters in 
+this representation.
+
+```{r}
+pca_data$loadings
+```
+
+Alternate approach using **tSNE** for feature reduction:
+
+Colored by weekday:
+
+```{r}
+tsne(df_filled  %>% select(-month,-year,-Time, -trimester, -weekday, -day, -date, -num_time) %>% scale %>% t, labels = df_filled$weekday, dotsize=0.1)
+```
+Colored by trimester:
+
+```{r}
+tsne(df_filled %>% select(-month,-year,-Time, -trimester, -weekday, -day, -date, -T, -AH, -RH, -num_time) %>% scale %>% t, labels = df_filled$trimester %>% as.factor, dotsize=0.1)
+```
+It is interesting to see a sort of layered clusterization for the trimesters (even without any information about temperature/date).
+
+### Other clustering methods
+
+Here we try to see how other clustering methods map on the biplots we have already computed:
+
+* Hierarchical:
+
+```{r}
+df. <- df_filled %>% select(-month,-year,-Time, -trimester, -weekday, -day, -date, -num_time) 
+dist_mat <- dist(df. %>% scale, method = 'euclidian')
+hclust_ave <- hclust(dist_mat, method = 'complete')
+hclust_ave_cut <- cutree(hclust_ave, 8)
+ggbiplot(pca_data, alpha = 0.1, group = hclust_ave_cut %>% as.factor)
+```
+
+K-means:
+
+```{r}
+fviz_nbclust(df. %>% scale, kmeans, method = "silhouette")
+```
+
+
+```{r}
+kmeans_clusters <- kmeans(df. %>% scale,2)
+ggbiplot(pca_data, alpha = 0.1, group = kmeans_clusters$cluster %>% as.factor)
+```
+
+
+## Violin plots with comparisons
+
+Finally, we can use the imputed datasets to complete our violin plots with statistical tests
+
+```{r}
+col.names <- df_filled %>% select(dplyr::ends_with("GT.")) %>% colnames()
+for(i in col.names){
+    df. <- (df_filled %>% select(!!i, trimester)) 
+    df. <- df.[complete.cases(df.), ]
+    levs <- levels( as.factor(df.$trimester) )
+    CN <- as.list(as.data.frame(combn(levs,2)))
+    p <- df. %>%
+        pivot_longer(dplyr::ends_with("GT."), names_to = "agent", values_to="values") %>% ggplot(aes(x = as.factor(trimester), y=values)) +
+        geom_violin() +
+        geom_boxplot(width=0.1) +
+        stat_compare_means(comparisons = CN, map_signif_level = TRUE) + 
+        labs(title=paste(i, "readout per trimester"), x="trimester", y="readout")
+    print(p)
+}
+```
+
+
+
+
